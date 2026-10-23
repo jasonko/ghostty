@@ -1229,6 +1229,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             realization.commit();
         }
 
+        /// Replaces the platform presentation object while retaining terminal
+        /// state and the graphics backend.
+        pub fn rebuildPresentation(self: *Self, surface: *apprt.Surface) !void {
+            if (@hasDecl(GraphicsAPI, "rebuildPresentation")) {
+                try self.api.rebuildPresentation(surface);
+            }
+            self.cells_rebuilt = true;
+        }
+
         /// This is called by the GTK apprt when the surface is being destroyed.
         /// This can happen because the surface is being closed but also when
         /// moving the window between displays or splitting.

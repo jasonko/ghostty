@@ -2,6 +2,7 @@
 //! for settings its `contents` to an IOSurface.
 const IOSurfaceLayer = @This();
 
+const builtin = @import("builtin");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const objc = @import("objc");
@@ -26,6 +27,7 @@ const SurfaceGeneration = struct {
     refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
     scheduled: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     committed: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    cache_flushes_remaining: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
     fn create() !*Self {
         const self = try std.heap.c_allocator.create(Self);
@@ -73,6 +75,23 @@ const SurfaceGeneration = struct {
     fn shouldClear(self: *const Self, cutoff: u64) bool {
         return self.committed.load(.acquire) <= cutoff;
     }
+
+    fn requestCacheFlushes(self: *Self, count: u8) void {
+        self.cache_flushes_remaining.store(count, .release);
+    }
+
+    fn consumeCacheFlush(self: *Self) bool {
+        var current = self.cache_flushes_remaining.load(.acquire);
+        while (current > 0) {
+            current = self.cache_flushes_remaining.cmpxchgWeak(
+                current,
+                current - 1,
+                .acq_rel,
+                .acquire,
+            ) orelse return true;
+        }
+        return false;
+    }
 };
 
 /// The underlying CALayer
@@ -113,6 +132,34 @@ pub fn init() !IOSurfaceLayer {
 pub fn release(self: *IOSurfaceLayer) void {
     self.surface_generation.release();
     self.layer.release();
+}
+
+/// Installs this layer on the platform view and applies its drawable scale.
+pub fn attachToView(
+    self: *IOSurfaceLayer,
+    view: objc.Object,
+    scale_factor: f64,
+) void {
+    var block = AttachToViewBlock.init(.{
+        .layer = self.layer.value,
+        .view = view.value,
+        .scale_factor = scale_factor,
+    }, &attachToViewCallback);
+
+    const NSThread = objc.getClass("NSThread").?;
+    if (NSThread.msgSend(bool, "isMainThread", .{})) {
+        attachToViewCallback(&block);
+    } else {
+        macos.dispatch.dispatch_sync(
+            @ptrCast(macos.dispatch.queue.getMain()),
+            @ptrCast(&block),
+        );
+    }
+}
+
+/// Flushes the next `count` surfaces before assigning them to this layer.
+pub fn requestCacheFlushes(self: *IOSurfaceLayer, count: u8) void {
+    self.surface_generation.requestCacheFlushes(count);
 }
 
 /// Detaches this layer from its host if its display callback still belongs to
@@ -331,9 +378,20 @@ fn surfaceClearRunsInline(is_main_thread: bool) bool {
 /// Does not ensure this happens on the main thread.
 pub inline fn setSurfaceSync(self: *IOSurfaceLayer, surface: *IOSurface) void {
     const generation = self.surface_generation.schedule();
+    if (comptime builtin.os.tag == .macos) {
+        if (self.surface_generation.consumeCacheFlush()) {
+            surface.flushProcessorCaches();
+        }
+    }
     self.layer.setProperty("contents", surface);
     self.surface_generation.commit(generation);
 }
+
+const AttachToViewBlock = objc.Block(struct {
+    layer: objc.c.id,
+    view: objc.c.id,
+    scale_factor: f64,
+}, .{}, void);
 
 const SetSurfaceBlock = objc.Block(struct {
     layer: objc.c.id,
@@ -368,6 +426,31 @@ const ClearSurfaceBlock = objc.Block(struct {
     surface_generation: *SurfaceGeneration,
     cutoff: u64,
 }, .{}, void);
+
+fn attachToViewCallback(
+    block: *const AttachToViewBlock.Context,
+) callconv(.c) void {
+    const layer = objc.Object.fromId(block.layer);
+    const view = objc.Object.fromId(block.view);
+
+    switch (comptime builtin.os.tag) {
+        .macos => {
+            view.setProperty("layer", layer.value);
+            view.setProperty("wantsLayer", true);
+        },
+
+        .ios => {
+            const view_layer = objc.Object.fromId(view.getProperty(?*anyopaque, "layer"));
+            view_layer.msgSend(void, objc.sel("addSublayer:"), .{layer.value});
+        },
+
+        else => @compileError("unsupported target for IOSurfaceLayer"),
+    }
+
+    view.setProperty("clipsToBounds", true);
+    layer.setProperty("contentsScale", block.scale_factor);
+    layer.setProperty("needsDisplayOnBoundsChange", true);
+}
 
 fn setSurfaceCallback(
     block: *const SetSurfaceBlock.Context,
@@ -406,6 +489,11 @@ fn setSurfaceCallback(
         return;
     }
 
+    if (comptime builtin.os.tag == .macos) {
+        if (block.surface_generation.consumeCacheFlush()) {
+            surface.flushProcessorCaches();
+        }
+    }
     layer.setProperty("contents", surface);
     block.surface_generation.commit(block.generation);
     if (block.presentation_callback) |callback| {
@@ -788,4 +876,21 @@ test "deferred clear uses the last committed surface generation" {
     generations.commit(replacement);
     try testing.expect(!generations.shouldClear(rejected));
     try testing.expect(!generations.shouldCommit(committed));
+}
+
+test "cache flush requests are consumed exactly once per surface" {
+    const testing = std.testing;
+
+    var generations = try SurfaceGeneration.create();
+    defer generations.release();
+
+    generations.requestCacheFlushes(3);
+    try testing.expect(generations.consumeCacheFlush());
+    try testing.expect(generations.consumeCacheFlush());
+    try testing.expect(generations.consumeCacheFlush());
+    try testing.expect(!generations.consumeCacheFlush());
+
+    generations.requestCacheFlushes(1);
+    try testing.expect(generations.consumeCacheFlush());
+    try testing.expect(!generations.consumeCacheFlush());
 }

@@ -90,7 +90,8 @@ const RendererRealizedRequest = enum(u8) {
 /// owned payloads, so producers can replace an unread request instead of
 /// waiting for space in the ordered renderer mailbox. Renderer rebuild is the
 /// one stronger operation: a redundant realize publication preserves it so a
-/// forced unrealize/realize transaction cannot be coalesced away.
+/// forced unrealize/realize transaction and platform presentation replacement
+/// cannot be coalesced away.
 ///
 /// Each property has its own atomic slot. Zero means no pending request;
 /// booleans use one/two for false/true, renderer realization uses the enum
@@ -1643,6 +1644,7 @@ fn applyRendererRealized(
 ) !void {
     if (request == .rebuild) {
         try self.applyRendererRealized(.unrealize);
+        try self.renderer.rebuildPresentation(self.surface);
         return self.applyRendererRealized(.realize);
     }
 

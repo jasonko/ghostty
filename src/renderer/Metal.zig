@@ -63,20 +63,38 @@ const ExternalLeasedPresenter = struct {
     ) callconv(.c) rendererpkg.external_frame.Disposition,
 };
 
+const ViewInfo = struct {
+    view: objc.Object,
+    scale_factor: f64,
+};
+
+fn viewInfo(rt_surface: *apprt.Surface) ViewInfo {
+    return .{
+        .scale_factor = @floatCast(rt_surface.content_scale.x),
+        .view = switch (rt_surface.platform) {
+            .macos => |value| value.nsview,
+            .ios => |value| value.uiview,
+            .metal_external => unreachable,
+            .metal_external_leased => unreachable,
+            .opengl => unreachable,
+        },
+    };
+}
+
 const Presenter = union(enum) {
     layer: IOSurfaceLayer,
     external: ExternalPresenter,
     external_leased: ExternalLeasedPresenter,
 
-    fn init(opts: rendererpkg.Options) !Presenter {
-        switch (opts.rt_surface.platform) {
+    fn init(rt_surface: *apprt.Surface) !Presenter {
+        switch (rt_surface.platform) {
             .metal_external => |config| return .{ .external = .{
-                .surface = opts.rt_surface,
+                .surface = rt_surface,
                 .userdata = config.userdata,
                 .present_callback = config.present,
             } },
             .metal_external_leased => |config| return .{ .external_leased = .{
-                .surface = opts.rt_surface,
+                .surface = rt_surface,
                 .userdata = config.userdata,
                 .present_callback = config.present,
             } },
@@ -84,21 +102,7 @@ const Presenter = union(enum) {
             .opengl => return error.OpenGLPlatformNotSupportedByMetal,
         }
 
-        const ViewInfo = struct {
-            view: objc.Object,
-            scale_factor: f64,
-        };
-
-        const info: ViewInfo = .{
-            .scale_factor = @floatCast(opts.rt_surface.content_scale.x),
-            .view = switch (opts.rt_surface.platform) {
-                .macos => |value| value.nsview,
-                .ios => |value| value.uiview,
-                .metal_external => unreachable,
-                .metal_external_leased => unreachable,
-                .opengl => unreachable,
-            },
-        };
+        const info = viewInfo(rt_surface);
 
         // Create an IOSurfaceLayer which we can assign to the view to make
         // it in to a "layer-hosting view", so that we can manually control
@@ -106,39 +110,7 @@ const Presenter = union(enum) {
         var layer = try IOSurfaceLayer.init();
         errdefer layer.release();
 
-        // Add our layer to the view.
-        //
-        // On macOS we do this by making the view "layer-hosting"
-        // by assigning it to the view's `layer` property BEFORE
-        // setting `wantsLayer` to `true`.
-        //
-        // On iOS, views are always layer-backed, and `layer`
-        // is readonly, so instead we add it as a sublayer.
-        switch (comptime builtin.os.tag) {
-            .macos => {
-                info.view.setProperty("layer", layer.layer.value);
-                info.view.setProperty("wantsLayer", true);
-            },
-
-            .ios => {
-                const view_layer = objc.Object.fromId(info.view.getProperty(?*anyopaque, "layer"));
-                view_layer.msgSend(void, objc.sel("addSublayer:"), .{layer.layer.value});
-            },
-
-            else => @compileError("unsupported target for Metal"),
-        }
-
-        // Ensure that if our layer is oversized it
-        // does not overflow the bounds of the view.
-        info.view.setProperty("clipsToBounds", true);
-
-        // Ensure that our layer has a content scale set to
-        // match the scale factor of the window. This avoids
-        // magnification issues leading to blurry rendering.
-        layer.layer.setProperty("contentsScale", info.scale_factor);
-
-        // This makes it so that our display callback will actually be called.
-        layer.layer.setProperty("needsDisplayOnBoundsChange", true);
+        layer.attachToView(info.view, info.scale_factor);
 
         return .{ .layer = layer };
     }
@@ -250,7 +222,7 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
     );
 
     const presenter = switch (apprt.runtime) {
-        apprt.embedded => try Presenter.init(opts),
+        apprt.embedded => try Presenter.init(opts.rt_surface),
         else => @compileError("unsupported apprt for metal"),
     };
     errdefer {
@@ -326,6 +298,33 @@ pub fn displayRealized(self: *Metal) !void {
 /// The renderer remains logically unrealized and may retry from a clean state.
 pub fn displayRealizedRollback(self: *Metal) void {
     self.queue.release();
+}
+
+/// Replaces the macOS presentation layer after WindowServer loses the old
+/// IOSurface registration across a display or system sleep transition.
+pub fn rebuildPresentation(self: *Metal, rt_surface: *apprt.Surface) !void {
+    if (comptime builtin.os.tag != .macos) return;
+
+    const current = switch (self.presenter) {
+        .layer => |*value| value,
+        .external, .external_leased => return,
+    };
+    var replacement = try IOSurfaceLayer.init();
+    errdefer replacement.release();
+
+    const info = viewInfo(rt_surface);
+    current.invalidateSurfaceUpdates();
+    replacement.attachToView(info.view, info.scale_factor);
+
+    current.release();
+    current.* = replacement;
+    current.requestCacheFlushes(swap_chain_count);
+
+    const renderer: *Renderer = @alignCast(@fieldParentPtr("api", self));
+    current.setDisplayCallback(
+        @ptrCast(&displayCallback),
+        @ptrCast(renderer),
+    );
 }
 
 /// Install a distinct gate before replacement swap-chain frames can be used.

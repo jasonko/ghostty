@@ -5388,10 +5388,10 @@ pub const CAPI = struct {
             return true;
         }
 
-        /// Force one unrealize/realize transaction on the renderer thread.
-        /// Unlike two latest-value boolean publications, this cannot lose the
-        /// unrealize step when a surface becomes presentable before the renderer
-        /// consumes its earlier state.
+        /// Force one unrealize/presentation-rebuild/realize transaction on the
+        /// renderer thread. Unlike two latest-value boolean publications, this
+        /// cannot lose the teardown step when a surface becomes presentable
+        /// before the renderer consumes its earlier state.
         export fn ghostty_surface_rebuild_renderer(ptr: *Surface) bool {
             const surface = &ptr.core_surface;
             surface.renderer_thread.publishRendererRebuild();

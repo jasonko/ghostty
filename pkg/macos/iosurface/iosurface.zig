@@ -6,6 +6,8 @@ const foundation = @import("../foundation.zig");
 const graphics = @import("../graphics.zig");
 const video = @import("../video.zig");
 
+extern "c" fn IOSurfaceFlushProcessorCaches(buffer: *anyopaque) c_int;
+
 pub const IOSurface = opaque {
     pub const Error = error{
         InvalidOperation,
@@ -96,6 +98,10 @@ pub const IOSurface = opaque {
             0,
             null,
         );
+    }
+
+    pub inline fn flushProcessorCaches(self: *IOSurface) void {
+        _ = IOSurfaceFlushProcessorCaches(@ptrCast(self));
     }
 
     pub inline fn getAllocSize(self: *IOSurface) usize {
